@@ -1,7 +1,10 @@
+import contextlib
+from subprocess import call
 from fastapi import FastAPI, Request, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from asyncio import Event
+import asyncio
 from uuid import uuid4
 import json
 import httpx
@@ -32,11 +35,11 @@ app.add_middleware(
 )
 
 # key variables
-
 callback_event = {} # callback event(signals) of async 
-# records = [] # for list view
 records_dict = {} # quick search record
 ret_msg = {} # callback Request
+CALL_BACK_URL_PREFIX = 'https://alley.luobotou.org:8000/a2s/callback/'
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -58,17 +61,39 @@ async def request_a2s(req_id:str, req: Request):
         req_body = req_body.decode()
         req_json = json.loads(req_body)
         req_json['A2S'] = {
-            'callback': '',
+            'callback': CALL_BACK_URL_PREFIX + callback_id,
             'callbackId': callback_id
         }
         return req_json
 
+    class CallbackEventContext:
+
+        def __init__(self, callback_id) -> Event:
+            self.callback_id = callback_id
+
+        def __enter__(self) -> Event:
+            callback_event[self.callback_id] = Event()
+            return callback_event[self.callback_id]
+
+        def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+            del callback_event[self.callback_id]
+            if exc_type:
+                print(exc_val)
+            return True
+
     if req_id in records_dict and records_dict[req_id].proxyAddr:
         rec: A2SRecord = records_dict[req_id]
         req_json = await build_body(rec)
-        callback_event[callback_id] = Event()
-        res = httpx.post(rec.proxyAddr, json=req_json)
-        await callback_event[callback_id].wait()
+        is_set = False
+        with CallbackEventContext(callback_id) as event:
+            res = httpx.post(rec.proxyAddr, json=req_json)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(event.wait(), rec.expire)
+            is_set = event.is_set()
+
+        if not is_set:
+            raise HTTPException(status_code=504, detail="wait callback timeout")
+
         callback_request:Request = ret_msg[callback_id]
         try:
             cb_json = json.loads( await callback_request.body())
@@ -77,7 +102,7 @@ async def request_a2s(req_id:str, req: Request):
             raise HTTPException(status_code=500, detail="json decode faild")
         except Exception as e:
             print(e.with_traceback())
-            raise HTTPException(status_code=500, detail="await call back faild")
+            raise HTTPException(status_code=500, detail="cb_json create faild")
         finally:
             del ret_msg[callback_id]
         return cb_json
@@ -105,8 +130,7 @@ async def request_a2s(callback_id:str, req: Request):
 async def create_a2s(record: A2SRecord):
     rid = str(uuid4())
     record.requestID = rid
-    record.expire = 9999
-    # records.append(record)
+    if not record.expire: record.expire = 600
     records_dict[rid] = record
     return record
 
@@ -120,6 +144,10 @@ async def delete_a2s(req_id: str):
     if req_id in records_dict:
         del records_dict[req_id]
     return {"success": True}
+
+@app.get("/a2s/listwaiting/")
+async def list_wating_event():
+    return list(callback_event.keys())
 
 """
 using tmux
